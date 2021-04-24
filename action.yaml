@@ -1,0 +1,137 @@
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# !!!!!!!!!!!!!! This repository is public !!!!!!!!!!!!!!!!!!!!!!!!
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+# repo is public until Github Action supports cloning private repos
+# https://github.com/github/roadmap/issues/74
+name: 'Run Kubernetes Job'
+description: 'Create a K8s Job and tails its logs until it fails or complete'
+inputs:
+  namespace:  # id of input
+    description: 'namespace to which create the Job'
+    required: true
+  name:
+    description: 'job name to create in namespace'
+    required: true
+  image:
+    description: 'image to run the job on'
+    required: true
+  command:
+    description: command the job will run, can be "cmd arg" or "['cmd', 'arg']"
+    required: false
+    default: "[]"
+  createNamespace:
+    description: '[true/false] whether to create the namespace, default to false'
+    required: false
+    default: 'false'
+  cleanNamespace:
+    description: '[true/false] whether to clean the namespace if the job complete in time'
+    required: false
+    default: 'false'
+outputs:
+  state:
+    description: "final state, can be 'complete', 'failed', 'starttimeout' or 'runtimeout'"
+    value: ${{ steps.finalState.outputs.state }}
+runs:
+  using: "composite"
+  steps:
+    - name: "Check inputs"
+      shell: bash
+      run: |
+        echo "check input:"
+        echo "namespace: ${{ inputs.namespace }}"
+        echo "name: ${{ inputs.name }}"
+        echo "image: ${{ inputs.image }}"
+        echo "command: ${{ inputs.command }}"
+        echo "createNamespace: ${{ inputs.createNamespace }}"
+        echo "cleanNamespace: ${{ inputs.cleanNamespace }}"
+
+    - name: "Create Namespace"
+      shell: bash
+      run: |
+        [[ "${{ inputs.createNamespace }}" != "true" ]] && exit 0
+        kubectl delete namespace ${{ inputs.namespace }} || true
+        kubectl create namespace ${{ inputs.namespace }}
+
+    - name: "Create Job"
+      shell: bash
+      run: |
+        set -e
+
+        cat <<EOF > job.yaml
+        apiVersion: batch/v1
+        kind: Job
+        metadata:
+          name: ${{ inputs.name }}
+          namespace: ${{ inputs.namespace }}
+        spec:
+          backoffLimit: 1
+          completions: 1
+          parallelism: 1
+          template:
+            spec:
+              restartPolicy: OnFailure
+              containers:
+                - name: ${{ inputs.name }}
+                  image: ${{ inputs.image }}
+                  imagePullPolicy: Always
+                  command: ${{ inputs.command }}
+                  env:
+        EOF
+
+        for e in $(printenv); do
+          IFS='=' read -r -a key_val  <<< "$e"
+          name=${key_val[0]}
+          [[ "${name}" != _* ]] && continue
+          name=${name:1}
+          [[ "${name}" == "" ]] && continue
+          # indent has to match the above heredoc
+          cat <<EOF >> job.yaml
+                      - name: "${name}"
+                        value: "${key_val[1]}"
+        EOF
+        done
+
+        echo "Job :"
+        cat job.yaml
+        echo "Creating Job ${{ inputs.name }}"
+        kubectl apply -f job.yaml
+
+    - name: "Wait for Job to start"
+      shell: bash
+      run: |
+        set -e
+        set -x
+        echo "Waiting for Job pods"
+
+        # TODO add a timeout waiting for pods
+        while [[ ! $(kubectl -n ${{ inputs.namespace }} logs -f job/${{ inputs.name }}) ]]; do echo "waiting..."; sleep 2; done;
+
+#        while [[ $(kubectl -n ${{ inputs.namespace }} get pods -l job-name=${{ inputs.name }} -o 'jsonpath={..status.conditions[?(@.type=="Ready")]}') == "" ]]; do echo "waiting for pod" && sleep 1; done
+
+
+    - name: "Tails logs"
+      shell: bash
+      run: |
+        echo "Tailing Jobs logs"
+        # TODO add timeout tailing jobs log
+        kubectl -n ${{ inputs.namespace }} logs -f job/${{ inputs.name }}
+
+
+    - name: "Check final state"
+      id: finalState
+      shell: bash
+      run: |
+        echo "Job finished, checking final status, if it's not 'complete', step fail"
+        # TODO do it better to get more state
+        kubectl -n ${{ inputs.namespace }} wait --for=condition=complete --timeout=1s job/${{ inputs.name }}
+        echo "Job is in 'complete' state, it ended with sucess"
+        state="complete"
+        echo "::set-output name=state::${state}"
+
+
+    - name: "Clean Namespace"
+      shell: bash
+      run: |
+        [[ "${{ inputs.cleanNamespace }}" != "true" ]] && exit 0
+        kubectl delete namespace ${{ inputs.namespace }} || true
