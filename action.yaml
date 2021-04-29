@@ -8,7 +8,7 @@ name: 'Run Kubernetes Job'
 description: 'Create a K8s Job and tails its logs until it fails or complete'
 inputs:
   namespace:  # id of input
-    description: 'namespace to which create the Job'
+    description: 'namespace to use (can be also created and/or deleted after use)'
     required: true
   name:
     description: 'job name to create in namespace'
@@ -24,40 +24,39 @@ inputs:
     description: '[true/false] whether to create the namespace, default to false'
     required: false
     default: 'false'
-  cleanNamespace:
-    description: '[true/false] whether to clean the namespace if the job complete in time'
+  deleteNamespace:
+    description: '[true/false] whether to delete the namespace if the job complete in time'
     required: false
     default: 'false'
-outputs:
-  state:
-    description: "final state, can be 'complete', 'failed', 'starttimeout' or 'runtimeout'"
-    value: ${{ steps.finalState.outputs.state }}
+  timeoutMinuteStartContainer:
+    description: 'how long to wait for pulling image and starting container, does not apply once the container is running. Use action timeout_minute to timeout the overall Job run'
+    required: false
+    default: "5"
 runs:
   using: "composite"
   steps:
     - name: "Check inputs"
       shell: bash
       run: |
-        echo "check input:"
+        echo "     Check input:"
         echo "namespace: ${{ inputs.namespace }}"
         echo "name: ${{ inputs.name }}"
         echo "image: ${{ inputs.image }}"
         echo "command: ${{ inputs.command }}"
         echo "createNamespace: ${{ inputs.createNamespace }}"
-        echo "cleanNamespace: ${{ inputs.cleanNamespace }}"
+        echo "deleteNamespace: ${{ inputs.cleanNamespace }}"
 
     - name: "Create Namespace"
       shell: bash
       run: |
         [[ "${{ inputs.createNamespace }}" != "true" ]] && exit 0
+        echo "     Re-create namespace"
         kubectl delete namespace ${{ inputs.namespace }} || true
         kubectl create namespace ${{ inputs.namespace }}
 
     - name: "Create Job"
       shell: bash
       run: |
-        set -e
-
         cat <<EOF > job.yaml
         apiVersion: batch/v1
         kind: Job
@@ -92,46 +91,64 @@ runs:
         EOF
         done
 
-        echo "Job :"
+        echo "     Job to be created:"
         cat job.yaml
-        echo "Creating Job ${{ inputs.name }}"
+        echo "     Creating Job ${{ inputs.name }}"
         kubectl apply -f job.yaml
 
-    - name: "Wait for Job to start"
+    - name: "Handle Job"
       shell: bash
       run: |
-        set -e
-        set -x
-        echo "Waiting for Job pods"
+        jobName=${{ inputs.name }}
+        namespace=${{ inputs.namespace }}
 
-        # TODO add a timeout waiting for pods
-        while [[ ! $(kubectl -n ${{ inputs.namespace }} logs -f job/${{ inputs.name }}) ]]; do echo "waiting..."; sleep 2; done;
+        [[ "${jobName}" == "" ]] && exit 0
 
-#        while [[ $(kubectl -n ${{ inputs.namespace }} get pods -l job-name=${{ inputs.name }} -o 'jsonpath={..status.conditions[?(@.type=="Ready")]}') == "" ]]; do echo "waiting for pod" && sleep 1; done
+        echo "     Wait for job '${jobName}' to be done"
 
+        # first check if Job isn't already done (either with success or not)
+        kubectl -n ${namespace} wait --for=condition=complete --timeout=0s job/${jobName} 2> /dev/null && done=true ||
+        kubectl -n ${namespace} wait --for=condition=failed --timeout=0s job/${jobName} 2> /dev/null && done=true || true
+        if [[ "${done}" != "true" ]]; then
+          echo "     Waiting for Job pod to pull images and start containers (timeout ${{ inputs.timeoutMinuteStartContainer }} minutes)"
+          # wait until we don't get an error fetching logs or until end of timeout
+          finaldate=$(date -d " ${{ inputs.timeoutMinuteStartContainer }} minutes" +'%m/%d %H:%M')
+          ready=false
+          while [[ $ready != "true" ]]; do
+              [[ "$(date +'%m/%d %H:%M')" > "${finaldate}" ]] && echo "     Err: Timeout waiting for pods" && exit 1
+              echo "... waiting"
+              sleep 10
+              kubectl -n ${namespace} logs --tail=0 job/${jobName}  2> /dev/null && ready=true || true
+          done
+          echo "     Job is running"
+        else
+          echo "     Job is already done (logs might not be available if it complete too long ago)"
+        fi
 
-    - name: "Tails logs"
-      shell: bash
-      run: |
-        echo "Tailing Jobs logs"
-        # TODO add timeout tailing jobs log
-        kubectl -n ${{ inputs.namespace }} logs -f job/${{ inputs.name }}
+        # then try to get logs
+        echo "     Attempt to fetch logs"
+        echo "-----------------------------"
+        echo ""
+        kubectl -n ${namespace} logs -f job/${jobName} || true
+        echo ""
+        echo "-----------------------------"
 
-
-    - name: "Check final state"
-      id: finalState
-      shell: bash
-      run: |
-        echo "Job finished, checking final status, if it's not 'complete', step fail"
-        # TODO do it better to get more state
-        kubectl -n ${{ inputs.namespace }} wait --for=condition=complete --timeout=1s job/${{ inputs.name }}
-        echo "Job is in 'complete' state, it ended with sucess"
-        state="complete"
-        echo "::set-output name=state::${state}"
-
+        # before checking final status
+        echo "     Job is done, checking final status"
+        # not elegant but the safest way to get the overall Job status as .failed and conditions start to get tricky
+        # to look into as long as more than backofflimit is not 0
+        kubectl -n ${namespace} wait --for=condition=complete --timeout=0s job/${jobName} && complete=true || true
+        if [[ "${complete}" == "true" ]]; then
+          echo "     Job final state is 'complete', it ended with sucess"
+        else
+          echo "     Job final state is not 'complete', it ended with failures"
+          echo "     Namespace ${{ inputs.deleteNamespace }} will not be deleted to allow debugging"
+          exit 1
+        fi
 
     - name: "Clean Namespace"
       shell: bash
       run: |
-        [[ "${{ inputs.cleanNamespace }}" != "true" ]] && exit 0
+        [[ "${{ inputs.deleteNamespace }}" != "true" ]] && exit 0
+        echo "     Delete namespace"
         kubectl delete namespace ${{ inputs.namespace }} || true
