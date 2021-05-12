@@ -149,7 +149,7 @@ runs:
           echo "     Job final state is 'complete', it ended with sucess"
         else
           echo "     Job final state is not 'complete', it ended with failures"
-          echo "     Namespace ${{ namespace }} will not be deleted to allow debugging"
+          echo "     Namespace ${{ inputs.namespace }} will not be deleted to allow debugging"
           exit 1
         fi
 
